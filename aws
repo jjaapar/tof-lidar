@@ -47,3 +47,12 @@ device_id = rad-sat-03-door-sensor-01
 
 # Role duration timeout
 credential_duration = 3000
+
+{"event":"status_query","state":"closed","distance_cm":149,"signal_strength":3167,"uptime_ms":24942}
+{"event":"status_query","state":"closed","distance_cm":149,"signal_strength":3168,"uptime_ms":376254}
+{"event":"state_change","state":"open","distance_cm":183,"signal_strength":2012,"uptime_ms":902720}
+{"event":"state_change","state":"closed","distance_cm":149,"signal_strength":3107,"uptime_ms":1319521}
+{"event":"state_change","state":"open","distance_cm":194,"signal_strength":1837,"uptime_ms":4330612}
+{"event":"state_change","state":"closed","distance_cm":120,"signal_strength":9163,"uptime_ms":4358388}
+{"event":"state_change","state":"open","distance_cm":193,"signal_strength":1833,"uptime_ms":4367439}
+{"event":"state_change","state":"closed","distance_cm":149,"signal_strength":3182,"uptime_ms":4450448}
