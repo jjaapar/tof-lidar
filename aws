@@ -9,21 +9,9 @@ response = sts_client.assume_role(
     RoleSessionName='test-session'
 )
 
-key_path = /home/labuser/.ssh/id_ecdsa
 
-# SSH connection timeout in seconds
-timeout = 10
 
-[commands]
-# Command to execute when door opens (normal mode)
-#door_open = echo "Door opened at $(date)" >> /tmp/door_events.log && /opt/hitl-tools/src/light_control.py BLINK_RED && bash -ic "source /opt/hitl-tools/.manage_bashrc_functions && powercycle chroma --power-off"
-door_open = /opt/hitl-tools/src/door_event_handler.sh active
 
-# Command to execute when door closes
-door_closed = echo "Door closed at $(date)" >> /tmp/door_events.log
-
-# Command to execute when door opens in maintenance mode
-door_open_maint = /opt/hitl-tools/src/door_event_handler.sh maintenance
 
 [monitoring]
 # Delay between sensor checks in seconds
@@ -55,7 +43,7 @@ log_stream = door-events
 door_location = ChamberDoor
 
 # Device identifier (used as dimension in metrics)
-device_id = rad-sat-02-door-sensor-01
+device_id = rad-sat-03-door-sensor-01
 
 # Role duration timeout
 credential_duration = 3000
