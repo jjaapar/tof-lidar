@@ -9,11 +9,11 @@
 #define LIDAR_TX_PIN  D6   // GPIO9 — transmits data TO TF-Luna RXD
 
 // ── Hysteresis thresholds (centimeters) ───────────────────────────────────
-#define CLOSED_THRESHOLD_CM  145
+#define CLOSED_THRESHOLD_CM  150
 #define OPEN_THRESHOLD_CM    170
 
 // ── Debounce: require new state to persist this long before confirming ────
-#define DEBOUNCE_MS  500
+#define DEBOUNCE_MS  5000
 
 // ── Minimum valid distance — ignore readings below this ───────────────────
 #define MIN_VALID_DISTANCE_CM  120
@@ -86,10 +86,10 @@ void loop() {
 
     // Debug: print distance every 500 ms for calibration
     // Comment out once thresholds are calibrated
-    if (millis() - lastPrintMs >= 500) {
-      lastPrintMs = millis();
-      Serial.printf("{\"event\":\"debug\",\"distance_cm\":%d,\"signal_strength\":%d}\r\n", dist, strength);
-    }
+    // if (millis() - lastPrintMs >= 500) {
+    //  lastPrintMs = millis();
+    //  Serial.printf("{\"event\":\"debug\",\"distance_cm\":%d,\"signal_strength\":%d}\r\n", dist, strength);
+    // }
   }
 }
 
