@@ -1,58 +1,486 @@
-import boto3
+#!/usr/bin/env python3
+"""
+door_monitor.py — Reads door-state JSON from an Arduino Nano ESP32 on /dev/ttyACM0,
+extracts TIME and DOOR STATE, and ships to AWS CloudWatch via an assumed IAM role.
 
-# Create STS client
-sts_client = boto3.client('sts')
+Usage:
+    Daemon mode (default):  python3 door_monitor.py
+    Interactive mode:       python3 door_monitor.py --interactive
+    With custom config:     python3 door_monitor.py --config /path/to/config.ini
+    With custom device:     python3 door_monitor.py --device /dev/ttyACM1
+"""
 
-# Try to assume the role
-response = sts_client.assume_role(
-    RoleArn='arn:aws:iam::448355772178:role/plexus-venue-health-check-cloudwatch-role',
-    RoleSessionName='test-session'
+import argparse
+import configparser
+import json
+import logging
+import signal
+import sys
+import time
+import threading
+from datetime import datetime, timezone
+from pathlib import Path
+
+try:
+    import serial
+except ImportError:
+    sys.exit("ERROR: pyserial is required.  Install with:  pip install pyserial")
+
+try:
+    import boto3
+    from botocore.exceptions import ClientError, NoCredentialsError
+except ImportError:
+    sys.exit("ERROR: boto3 is required.  Install with:  pip install boto3")
+
+
+# ── Defaults (overridden by config file) ────────────────────────────────────
+DEFAULTS = {
+    "device":              "/dev/ttyACM0",
+    "baud_rate":           115200,
+    "alert_delay":         0.5,
+    "debounce_delay":      1.0,
+    "cw_enabled":          True,
+    "aws_role":            "arn:aws:iam::448355772178:role/plexus-venue-health-check-cloudwatch-role",
+    "aws_region":          "us-west-2",
+    "namespace":           "DoorStateMonitoring",
+    "log_group":           "door-sensor",
+    "log_stream":          "door-events",
+    "door_location":       "ChamberDoor",
+    "device_id":           "rad-sat-03-door-sensor-01",
+    "credential_duration": 3000,
+}
+
+# ── Logging setup ───────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
 )
+log = logging.getLogger("door_monitor")
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Config loader
+# ═══════════════════════════════════════════════════════════════════════════════
+def load_config(path: str | None) -> dict:
+    """Merge config-file values on top of DEFAULTS."""
+    cfg = dict(DEFAULTS)
+    if path and Path(path).is_file():
+        parser = configparser.ConfigParser()
+        parser.read(path)
+
+        if parser.has_section("monitoring"):
+            cfg["alert_delay"]    = parser.getfloat("monitoring", "alert_delay",    fallback=cfg["alert_delay"])
+            cfg["debounce_delay"] = parser.getfloat("monitoring", "debounce_delay", fallback=cfg["debounce_delay"])
+
+        if parser.has_section("cloudwatch"):
+            cfg["cw_enabled"]          = parser.getboolean("cloudwatch", "enabled",             fallback=cfg["cw_enabled"])
+            cfg["aws_role"]            = parser.get("cloudwatch",        "aws_role",            fallback=cfg["aws_role"])
+            cfg["aws_region"]          = parser.get("cloudwatch",        "aws_region",          fallback=cfg["aws_region"])
+            cfg["namespace"]           = parser.get("cloudwatch",        "namespace",           fallback=cfg["namespace"])
+            cfg["log_group"]           = parser.get("cloudwatch",        "log_group",           fallback=cfg["log_group"])
+            cfg["log_stream"]          = parser.get("cloudwatch",        "log_stream",          fallback=cfg["log_stream"])
+            cfg["door_location"]       = parser.get("cloudwatch",        "door_location",       fallback=cfg["door_location"])
+            cfg["device_id"]           = parser.get("cloudwatch",        "device_id",           fallback=cfg["device_id"])
+            cfg["credential_duration"] = parser.getint("cloudwatch",     "credential_duration", fallback=cfg["credential_duration"])
+
+        log.info("Loaded config from %s", path)
+    else:
+        log.info("No config file — using defaults")
+
+    return cfg
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# AWS CloudWatch client with STS role assumption + auto-refresh
+# ═══════════════════════════════════════════════════════════════════════════════
+class CloudWatchUploader:
+    """Assumes an IAM role via STS and pushes metrics + logs to CloudWatch."""
 
-[monitoring]
-# Delay between sensor checks in seconds
-alert_delay = 0.5
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.enabled = cfg["cw_enabled"]
+        self._cw_client = None
+        self._logs_client = None
+        self._credential_expiry = 0.0
+        self._sequence_token = None
+        self._lock = threading.Lock()
 
-# Debounce delay to avoid false triggers in seconds
-debounce_delay = 1.0
+        if self.enabled:
+            self._refresh_credentials()
+            self._ensure_log_group_and_stream()
 
-[cloudwatch]
-# Enable CloudWatch logging and metrics (True/False)
-enabled = True
+    # ── STS credential management ───────────────────────────────────────────
+    def _refresh_credentials(self):
+        """Assume the IAM role and create fresh CW / Logs clients."""
+        log.info("Assuming IAM role: %s", self.cfg["aws_role"])
+        sts = boto3.client("sts", region_name=self.cfg["aws_region"])
+        resp = sts.assume_role(
+            RoleArn=self.cfg["aws_role"],
+            RoleSessionName="door-monitor-session",
+            DurationSeconds=self.cfg["credential_duration"],
+        )
+        creds = resp["Credentials"]
+        session = boto3.Session(
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"],
+            region_name=self.cfg["aws_region"],
+        )
+        self._cw_client   = session.client("cloudwatch")
+        self._logs_client  = session.client("logs")
+        # Refresh 5 minutes before actual expiry
+        self._credential_expiry = time.time() + self.cfg["credential_duration"] - 300
+        log.info("STS credentials refreshed (valid ~%d s)", self.cfg["credential_duration"] - 300)
 
-# AWS IAM role ARN to assume for CloudWatch access
-aws_role = arn:aws:iam::448355772178:role/plexus-venue-health-check-cloudwatch-role
+    def _ensure_fresh_credentials(self):
+        if time.time() >= self._credential_expiry:
+            self._refresh_credentials()
+            self._ensure_log_group_and_stream()
 
-# AWS region
-aws_region = us-west-2
+    # ── Log group / stream provisioning ─────────────────────────────────────
+    def _ensure_log_group_and_stream(self):
+        try:
+            self._logs_client.create_log_group(logGroupName=self.cfg["log_group"])
+            log.info("Created log group: %s", self.cfg["log_group"])
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "ResourceAlreadyExistsException":
+                raise
 
-# CloudWatch namespace for metrics
-namespace = DoorStateMonitoring
+        try:
+            self._logs_client.create_log_stream(
+                logGroupName=self.cfg["log_group"],
+                logStreamName=self.cfg["log_stream"],
+            )
+            log.info("Created log stream: %s", self.cfg["log_stream"])
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "ResourceAlreadyExistsException":
+                raise
 
-# CloudWatch Logs log group name
-log_group = door-sensor
+        self._sequence_token = self._get_sequence_token()
 
-# CloudWatch Logs log stream name
-log_stream = door-events
+    def _get_sequence_token(self) -> str | None:
+        resp = self._logs_client.describe_log_streams(
+            logGroupName=self.cfg["log_group"],
+            logStreamNamePrefix=self.cfg["log_stream"],
+            limit=1,
+        )
+        streams = resp.get("logStreams", [])
+        if streams:
+            return streams[0].get("uploadSequenceToken")
+        return None
 
-# Door location identifier (used as dimension in metrics)
-door_location = ChamberDoor
+    # ── Public: push a metric data-point ────────────────────────────────────
+    def put_metric(self, metric_name: str, value: float, unit: str = "None"):
+        if not self.enabled:
+            return
+        with self._lock:
+            self._ensure_fresh_credentials()
+            try:
+                self._cw_client.put_metric_data(
+                    Namespace=self.cfg["namespace"],
+                    MetricData=[
+                        {
+                            "MetricName": metric_name,
+                            "Dimensions": [
+                                {"Name": "DoorLocation", "Value": self.cfg["door_location"]},
+                                {"Name": "DeviceId",     "Value": self.cfg["device_id"]},
+                            ],
+                            "Timestamp": datetime.now(timezone.utc),
+                            "Value": value,
+                            "Unit": unit,
+                        }
+                    ],
+                )
+                log.debug("Metric sent: %s = %s %s", metric_name, value, unit)
+            except (ClientError, NoCredentialsError) as e:
+                log.error("Failed to put metric: %s", e)
 
-# Device identifier (used as dimension in metrics)
-device_id = rad-sat-03-door-sensor-01
+    # ── Public: push a log event ────────────────────────────────────────────
+    def put_log_event(self, message: str):
+        if not self.enabled:
+            return
+        with self._lock:
+            self._ensure_fresh_credentials()
+            timestamp_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            kwargs = {
+                "logGroupName":  self.cfg["log_group"],
+                "logStreamName": self.cfg["log_stream"],
+                "logEvents": [{"timestamp": timestamp_ms, "message": message}],
+            }
+            if self._sequence_token:
+                kwargs["sequenceToken"] = self._sequence_token
+            try:
+                resp = self._logs_client.put_log_events(**kwargs)
+                self._sequence_token = resp.get("nextSequenceToken")
+                log.debug("Log event sent")
+            except (ClientError, NoCredentialsError) as e:
+                log.error("Failed to put log event: %s", e)
+                try:
+                    self._sequence_token = self._get_sequence_token()
+                except Exception:
+                    pass
 
-# Role duration timeout
-credential_duration = 3000
 
-{"event":"status_query","state":"closed","distance_cm":149,"signal_strength":3167,"uptime_ms":24942}
-{"event":"status_query","state":"closed","distance_cm":149,"signal_strength":3168,"uptime_ms":376254}
-{"event":"state_change","state":"open","distance_cm":183,"signal_strength":2012,"uptime_ms":902720}
-{"event":"state_change","state":"closed","distance_cm":149,"signal_strength":3107,"uptime_ms":1319521}
-{"event":"state_change","state":"open","distance_cm":194,"signal_strength":1837,"uptime_ms":4330612}
-{"event":"state_change","state":"closed","distance_cm":120,"signal_strength":9163,"uptime_ms":4358388}
-{"event":"state_change","state":"open","distance_cm":193,"signal_strength":1833,"uptime_ms":4367439}
-{"event":"state_change","state":"closed","distance_cm":149,"signal_strength":3182,"uptime_ms":4450448}
+# ═══════════════════════════════════════════════════════════════════════════════
+# Serial reader for JSON frames from the Arduino
+# ═══════════════════════════════════════════════════════════════════════════════
+class DoorSensorReader:
+    """Opens the serial port, sends commands, and yields parsed JSON dicts."""
+
+    def __init__(self, device: str, baud: int = 115200, timeout: float = 2.0):
+        self.device = device
+        self.baud = baud
+        self.timeout = timeout
+        self._port: serial.Serial | None = None
+
+    def open(self):
+        log.info("Opening serial port %s @ %d baud", self.device, self.baud)
+        self._port = serial.Serial(
+            port=self.device,
+            baudrate=self.baud,
+            timeout=self.timeout,
+        )
+        # Give the Arduino time to reset after serial connection
+        time.sleep(2)
+        self._port.reset_input_buffer()
+        log.info("Serial port ready")
+
+    def close(self):
+        if self._port and self._port.is_open:
+            self._port.close()
+            log.info("Serial port closed")
+
+    def send_command(self, cmd: str) -> dict | None:
+        """Send a text command (e.g. 'Status', 'Ping') and return the JSON response."""
+        if not self._port or not self._port.is_open:
+            return None
+        self._port.write(f"{cmd}\n".encode("utf-8"))
+        return self._read_json_line()
+
+    def read_event(self) -> dict | None:
+        """Read the next JSON line from the Arduino (blocking up to timeout)."""
+        return self._read_json_line()
+
+    def _read_json_line(self) -> dict | None:
+        try:
+            raw = self._port.readline()
+            if not raw:
+                return None
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line:
+                return None
+            return json.loads(line)
+        except json.JSONDecodeError:
+            log.warning("Non-JSON line received: %s", raw)
+            return None
+        except serial.SerialException as e:
+            log.error("Serial read error: %s", e)
+            return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Event processor — extracts TIME + DOOR STATE only, uploads to CloudWatch
+# ═══════════════════════════════════════════════════════════════════════════════
+class EventProcessor:
+    """Extracts door state and timestamp, uploads only those to CloudWatch."""
+
+    # Numeric encoding: 0 = closed, 1 = open, -1 = unknown
+    STATE_MAP = {"closed": 0.0, "open": 1.0, "unknown": -1.0}
+
+    def __init__(self, cw: CloudWatchUploader, cfg: dict):
+        self.cw = cw
+        self.cfg = cfg
+        self.last_state: str | None = None
+        self._last_debounce_time = 0.0
+
+    def handle(self, event: dict):
+        """Route an event dict to the appropriate handler."""
+        ev_type = event.get("event")
+        if ev_type is None:
+            return
+
+        if ev_type in ("state_change", "status_query"):
+            self._on_door_event(event)
+        elif ev_type == "pong":
+            log.info("PONG received — sensor alive")
+        elif ev_type == "boot":
+            log.info("Arduino booted: %s", event.get("message", ""))
+        elif ev_type == "error":
+            log.warning("Arduino error: %s", event.get("message", ""))
+
+    # ── Single handler for any event that carries state ─────────────────────
+    def _on_door_event(self, event: dict):
+        state     = event.get("state", "unknown")
+        uptime_ms = event.get("uptime_ms", 0)
+        timestamp = datetime.now(timezone.utc).isoformat()
+
+        # Host-side debounce for state_change events
+        if event.get("event") == "state_change":
+            now = time.time()
+            if now - self._last_debounce_time < self.cfg["debounce_delay"]:
+                log.debug("Debounce: suppressing duplicate state_change")
+                return
+            self._last_debounce_time = now
+
+        log.info("%s → %s  (uptime=%d ms, time=%s)",
+                 event.get("event"), state, uptime_ms, timestamp)
+        self.last_state = state
+
+        # ── CloudWatch metric: door state as 0 (closed) / 1 (open) ─────────
+        self.cw.put_metric("DoorState", self.STATE_MAP.get(state, -1.0))
+
+        # ── CloudWatch log: timestamp + state only ──────────────────────────
+        self.cw.put_log_event(json.dumps({
+            "timestamp": timestamp,
+            "state": state,
+            "uptime_ms": uptime_ms,
+        }))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Main monitor loop (daemon mode)
+# ═══════════════════════════════════════════════════════════════════════════════
+class DoorMonitor:
+    """Top-level orchestrator: wires the reader, processor, and uploader."""
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self._running = False
+        self.cw = CloudWatchUploader(cfg)
+        self.reader = DoorSensorReader(cfg["device"], cfg["baud_rate"])
+        self.processor = EventProcessor(self.cw, cfg)
+
+    def start(self):
+        self._running = True
+        self.reader.open()
+
+        # Request initial status
+        log.info("Requesting initial status...")
+        resp = self.reader.send_command("Status")
+        if resp:
+            self.processor.handle(resp)
+
+        log.info("Entering main loop (alert_delay=%.2fs)", self.cfg["alert_delay"])
+        try:
+            while self._running:
+                event = self.reader.read_event()
+                if event:
+                    self.processor.handle(event)
+                else:
+                    ping_resp = self.reader.send_command("Ping")
+                    if ping_resp:
+                        self.processor.handle(ping_resp)
+                    else:
+                        log.warning("No response to Ping — sensor may be disconnected")
+                time.sleep(self.cfg["alert_delay"])
+        except KeyboardInterrupt:
+            log.info("Interrupted by user")
+        finally:
+            self.stop()
+
+    def stop(self):
+        self._running = False
+        self.reader.close()
+        log.info("Monitor stopped")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Interactive mode — manual commands + live event display
+# ═══════════════════════════════════════════════════════════════════════════════
+def interactive_mode(cfg: dict):
+    """Opens a REPL where you can send commands to the Arduino and see events."""
+    cw = CloudWatchUploader(cfg)
+    reader = DoorSensorReader(cfg["device"], cfg["baud_rate"])
+    processor = EventProcessor(cw, cfg)
+    reader.open()
+
+    print("\n╔══════════════════════════════════════════════╗")
+    print("║   Door Sensor — Interactive Mode             ║")
+    print("║   Commands: status, ping, listen, quit       ║")
+    print("╚══════════════════════════════════════════════╝\n")
+
+    try:
+        while True:
+            cmd = input("door> ").strip().lower()
+            if cmd in ("quit", "exit", "q"):
+                break
+            elif cmd == "status":
+                resp = reader.send_command("Status")
+                if resp:
+                    processor.handle(resp)
+                    print(f"  state: {resp.get('state', '?')}  |  uptime: {resp.get('uptime_ms', 0)} ms")
+                else:
+                    print("(no response)")
+            elif cmd == "ping":
+                resp = reader.send_command("Ping")
+                if resp:
+                    processor.handle(resp)
+                    print("  sensor alive")
+                else:
+                    print("(no response)")
+            elif cmd == "listen":
+                print("Listening for events (Ctrl+C to stop)...")
+                try:
+                    while True:
+                        event = reader.read_event()
+                        if event:
+                            processor.handle(event)
+                            st = event.get("state", "")
+                            ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+                            if st:
+                                print(f"  [{ts}]  {st}")
+                        time.sleep(cfg["alert_delay"])
+                except KeyboardInterrupt:
+                    print("\nStopped listening.")
+            elif cmd == "help":
+                print("  status  — query current door state")
+                print("  ping    — health-check the sensor")
+                print("  listen  — stream live events (Ctrl+C to stop)")
+                print("  quit    — exit interactive mode")
+            else:
+                print(f"Unknown command: {cmd}  (type 'help')")
+    except (KeyboardInterrupt, EOFError):
+        pass
+    finally:
+        reader.close()
+        print("Bye.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Entry point
+# ═══════════════════════════════════════════════════════════════════════════════
+def main():
+    parser = argparse.ArgumentParser(description="Door sensor monitor → CloudWatch")
+    parser.add_argument("--config",        type=str, default=None, help="Path to .ini config file")
+    parser.add_argument("--device",        type=str, default=None, help="Serial device (default: /dev/ttyACM0)")
+    parser.add_argument("--interactive",   action="store_true",    help="Run in interactive REPL mode")
+    parser.add_argument("--no-cloudwatch", action="store_true",    help="Disable CloudWatch uploads (dry-run)")
+    parser.add_argument("--verbose",       action="store_true",    help="Enable debug logging")
+    args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    cfg = load_config(args.config)
+
+    if args.device:
+        cfg["device"] = args.device
+    if args.no_cloudwatch:
+        cfg["cw_enabled"] = False
+
+    # Graceful shutdown on SIGTERM (systemd sends this)
+    def handle_sigterm(signum, frame):
+        log.info("Received SIGTERM — shutting down")
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, handle_sigterm)
+
+    if args.interactive:
+        interactive_mode(cfg)
+    else:
+        monitor = DoorMonitor(cfg)
+        monitor.start()
+
+
+if __name__ == "__main__":
+    main()
