@@ -34,6 +34,8 @@ except ImportError:
 
 
 # ── Defaults (overridden by config file) ────────────────────────────────────
+PING_INTERVAL_S = 300  # 5 minutes between health-check pings
+
 DEFAULTS = {
     "device":              "/dev/ttyACM0",
     "baud_rate":           115200,
@@ -347,6 +349,7 @@ class DoorMonitor:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self._running = False
+        self._last_ping_time = 0.0
         self.cw = CloudWatchUploader(cfg)
         self.reader = DoorSensorReader(cfg["device"], cfg["baud_rate"])
         self.processor = EventProcessor(self.cw, cfg)
@@ -361,18 +364,24 @@ class DoorMonitor:
         if resp:
             self.processor.handle(resp)
 
-        log.info("Entering main loop (alert_delay=%.2fs)", self.cfg["alert_delay"])
+        log.info("Entering main loop (alert_delay=%.2fs, ping every %ds)",
+                 self.cfg["alert_delay"], PING_INTERVAL_S)
         try:
             while self._running:
                 event = self.reader.read_event()
                 if event:
                     self.processor.handle(event)
-                else:
+
+                # Health-check ping every 5 minutes
+                now = time.time()
+                if now - self._last_ping_time >= PING_INTERVAL_S:
+                    self._last_ping_time = now
                     ping_resp = self.reader.send_command("Ping")
                     if ping_resp:
                         self.processor.handle(ping_resp)
                     else:
                         log.warning("No response to Ping — sensor may be disconnected")
+
                 time.sleep(self.cfg["alert_delay"])
         except KeyboardInterrupt:
             log.info("Interrupted by user")
