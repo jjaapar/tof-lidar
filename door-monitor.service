@@ -1,0 +1,25 @@
+[Unit]
+Description=Door Sensor Monitor — TF-Luna LiDAR to CloudWatch
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/door-monitor
+ExecStart=/usr/bin/python3 /opt/door-monitor/door_monitor.py --config /opt/door-monitor/door_monitor.ini --device /dev/ttyACM0
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Ensure the service can access the serial device
+SupplementaryGroups=dialout
+
+# Hardening
+ProtectSystem=strict
+ReadWritePaths=/opt/door-monitor
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
