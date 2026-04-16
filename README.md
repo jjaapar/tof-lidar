@@ -1,0 +1,8 @@
+bash# Copy files into place
+sudo mkdir -p /opt/door-monitor
+sudo cp door_monitor.py door_monitor.ini /opt/door-monitor/
+
+# Install the service
+sudo cp door-monitor.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now door-monitor
