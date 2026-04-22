@@ -82,7 +82,7 @@ def load_config(path: str | None) -> dict:
             cfg["namespace"]           = parser.get("cloudwatch",        "namespace",           fallback=cfg["namespace"])
             cfg["log_group"]           = parser.get("cloudwatch",        "log_group",           fallback=cfg["log_group"])
             cfg["log_stream"]          = parser.get("cloudwatch",        "log_stream",          fallback=cfg["log_stream"])
-            cfg["door_location"]       = parser.get("cloudwatch",        "door_location",       fallback=cfg["door_location"])
+            cfg["location"]            = parser.get("cloudwatch",        "door_location",       fallback=cfg["door_location"])
             cfg["device_id"]           = parser.get("cloudwatch",        "device_id",           fallback=cfg["device_id"])
             cfg["credential_duration"] = parser.getint("cloudwatch",     "credential_duration", fallback=cfg["credential_duration"])
 
@@ -358,11 +358,13 @@ class DoorMonitor:
         self._running = True
         self.reader.open()
 
-        # Request initial status
+        # Request initial status (local only — no CloudWatch upload)
         log.info("Requesting initial status...")
         resp = self.reader.send_command("Status")
         if resp:
-            self.processor.handle(resp)
+            state = resp.get("state", "unknown")
+            self.processor.last_state = state
+            log.info("Initial state: %s", state)
 
         log.info("Entering main loop (alert_delay=%.2fs, ping every %ds)",
                  self.cfg["alert_delay"], PING_INTERVAL_S)
