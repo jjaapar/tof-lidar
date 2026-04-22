@@ -6,8 +6,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/door-monitor
-ExecStart=/usr/bin/python3 /opt/door-monitor/door_monitor.py --config /opt/door-monitor/door_monitor.ini --device /dev/ttyACM0
+WorkingDirectory=/opt/hitl-tools/src
+ExecStart=/usr/bin/python3 /opt/hitl-tools/src/door_sensor.py --config /etc/door-monitor/door_monitor.ini --device /dev/ttyACM0
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal
@@ -18,7 +18,7 @@ SupplementaryGroups=dialout
 
 # Hardening
 ProtectSystem=strict
-ReadWritePaths=/opt/door-monitor
+ReadWritePaths=/opt/hitl-tools/src
 PrivateTmp=true
 
 [Install]
